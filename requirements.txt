@@ -1,0 +1,8 @@
+# Install into ONE interpreter and run the tests as `python -m pytest`.
+# A bare `pytest` resolves independently of `python`, so a machine with
+# two environments will run the demo on the one with boto3 and the tests
+# on the one without.
+
+boto3>=1.40,<2          # bedrock-agentcore + bedrock-agentcore-control
+pydantic>=2.7,<3        # the tool-boundary contracts in gates.py
+pytest>=8.0             # evals/ (tier 1 offline, tier 2 live)

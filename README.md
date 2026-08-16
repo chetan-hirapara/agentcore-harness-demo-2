@@ -84,7 +84,9 @@ failure fails the suite with no pass-rate tolerance.
 
 ## What `demo_run.py` shows live:
 
-1. **Read-only gate** — every lookup crosses the `run_sql` contract
+1. **Read-only gate** — `UPDATE`, `DELETE`, `DROP` and a stacked
+   `SELECT 1; UPDATE ...` all blocked, driven directly against the same
+   `run_sql` the agent's tool use hits
 2. **Code interpreter** runs *our* shipped calculator → **$172.03**
 3. **`issue_refund`** — the independent recompute agrees, refund commits
 4. **Retry storm** — the same semantic action replayed 3×, ledger still
@@ -94,16 +96,23 @@ failure fails the suite with no pass-rate tolerance.
 5. **New session, same customer** — memory answers with **zero tool
    calls**; a different customer gets nothing
 
-### Two guarantees that don't fire on camera
+### Beat 1 is driven by us, not by the agent
 
-The mutation block and the hallucinated-amount refusal are enforced,
-but the live run doesn't trigger either — because the agent behaves
-correctly. Given the schema up front it goes straight to `SELECT` and
-routes the write through `issue_refund`, and its figure matches the
-policy engine, so there is nothing to refuse.
+Those blocked mutations are direct calls into `run_sql`. The agent
+doesn't attempt them: given the schema up front it goes straight to
+`SELECT` and routes the write through `issue_refund`.
 
-That is the intended outcome rather than a gap, and it *is* the
-argument: the guarantee is a Pydantic contract plus a `mode=ro`
-connection, not a prompt the model can outgrow. Both paths are proved
-deterministically offline — `test_mutations_are_blocked` (including
-stacked statements) and `test_agent_hallucinated_amount_is_refused`.
+Driving the gate ourselves is the more honest demonstration. The
+guarantee is a Pydantic contract plus a `mode=ro` connection, so it
+holds whether or not the model misbehaves on camera — waiting for it to
+trip would be theatre, and would prove strictly less. Note the stacked
+statement fails with a *different* error than the rest: it satisfies the
+`SELECT` regex and dies on the read-only connection, which is the second
+layer doing its job.
+
+The hallucinated-amount refusal doesn't fire live either, for the same
+reason — when the agent's figure matches the policy engine there is
+nothing to refuse. That path is proved offline alongside the mutation
+cases: `test_mutations_are_blocked`,
+`test_stacked_statement_blocked_by_second_layer`, and
+`test_agent_hallucinated_amount_is_refused`.
