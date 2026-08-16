@@ -82,9 +82,7 @@ every commit because the harness is ordinary software. Tier 2
 Memory isolation is the exception: it's a security property, so one
 failure fails the suite with no pass-rate tolerance.
 
-## Demo recording beats (~2.5 min)
-
-What `demo_run.py` shows live:
+## What `demo_run.py` shows live:
 
 1. **Read-only gate** — every lookup crosses the `run_sql` contract
 2. **Code interpreter** runs *our* shipped calculator → **$172.03**
