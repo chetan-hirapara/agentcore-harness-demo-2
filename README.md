@@ -1,0 +1,111 @@
+# agentcore-harness-demo
+
+A production harness around a non-deterministic agent, on **Amazon
+Bedrock AgentCore**. Domain: e-commerce returns and refunds support.
+
+**The ticket:** *"Order #4711 arrived damaged, I want a refund."*
+Resolving it correctly requires reading customer data, computing money
+under policy, and executing an irreversible write — three different
+risk tiers in one request.
+
+## The trust boundary
+
+Five capabilities, deliberately split across two sides:
+
+| Capability | Runs on | Why |
+|---|---|---|
+| `code_interpreter` | AWS microVM | Sandboxed compute; AWS handles isolation |
+| managed memory | AWS, actor-scoped | Per-customer history, isolated by `actorId` |
+| `run_sql` (L1 read) | **Our process** | Gated: read-only contract + read-only connection |
+| `issue_refund` (L3 write) | **Our process** | Gated: recompute + idempotency + 2-phase commit |
+
+Anything that can move money or leak data is an `inline_function`,
+because an inline function pauses the harness loop and hands control
+back to code we own. The gate is not in the model's environment, so it
+cannot be prompt-injected or argued with.
+
+## Four gates before money moves
+
+1. **Schema** — Pydantic contract on the tool boundary.
+2. **Independent recompute** — we re-run the policy engine ourselves and
+   refuse on any disagreement with the agent's figure. *The model is
+   what transcribed the number, so the number is not trusted.*
+3. **Idempotency** — key is a hash of the semantic action
+   `(order_id, reason, amount)`, and it's the `PRIMARY KEY` of
+   `refund_intents`. The guarantee is a database uniqueness
+   constraint, not application logic a race can slip between.
+4. **Two-phase commit** — `PENDING` before the effect, `COMMITTED`
+   after; a failure mid-flight triggers a compensating rollback.
+
+The policy calculator (`refund_calc.py`) is **shipped, not
+model-generated** — a sandbox doesn't make arithmetic deterministic if
+the model writes the arithmetic. It's seeded onto the microVM with
+`InvokeAgentRuntimeCommand`, and the same module is imported by the
+gate for verification. Money is `Decimal` end to end.
+
+## Files
+
+| File | Slide | What it is |
+|---|---|---|
+| `gates.py` | 6, 8 | Both tool contracts; the four refund gates |
+| `refund_calc.py` | 7 | Deterministic policy engine (shipped + verifying) |
+| `refund_ledger.py` | 8 | Idempotency keys, two-phase commit, rollback |
+| `budget.py` | — | Cost/iteration caps, bounded aborts |
+| `harness_client.py` | 5 | invoke → stream → gate → continue; episode records |
+| `demo_run.py` | 10 | The five recorded beats |
+| `evals/test_invariants.py` | 9 | 13 offline tests, no model calls |
+| `evals/test_trajectory.py` | 9 | Live N-run trajectory + memory isolation |
+
+## Run it
+
+```bash
+python -m pip install boto3 pydantic pytest
+bash setup.sh                             # AWS setup (read the comments)
+python gates.py                           # seed the database
+python -m pytest evals/test_invariants.py -v   # 13 tests, offline, ~0.2s
+export HARNESS_ARN=...                    # setup.sh prints this line
+python demo_run.py                        # the recorded scenario
+python -m pytest evals/test_trajectory.py -v   # 10 live runs + isolation
+```
+
+Use **one** interpreter for all of it, and invoke the tests as
+`python -m pytest`. A bare `pytest` resolves independently of `python`,
+so a machine with two environments will happily run the demo on the one
+with `boto3` and the tests on the one without.
+
+## Two-tier eval strategy
+
+Tier 1 (`test_invariants.py`) is deterministic and offline — it runs on
+every commit because the harness is ordinary software. Tier 2
+(`test_trajectory.py`) makes live model calls and asserts on the
+*distribution* across N runs; it runs on a schedule, not per-push.
+Memory isolation is the exception: it's a security property, so one
+failure fails the suite with no pass-rate tolerance.
+
+## Demo recording beats (~2.5 min)
+
+What `demo_run.py` shows live:
+
+1. **Read-only gate** — every lookup crosses the `run_sql` contract
+2. **Code interpreter** runs *our* shipped calculator → **$172.03**
+3. **`issue_refund`** — the independent recompute agrees, refund commits
+4. **Retry storm** — the same semantic action replayed 3×, ledger still
+   shows one row *(replay 1 already reports `duplicate=True`: it
+   collapses onto the refund the agent itself made, because the key is
+   the action, not the call site)*
+5. **New session, same customer** — memory answers with **zero tool
+   calls**; a different customer gets nothing
+
+### Two guarantees that don't fire on camera
+
+The mutation block and the hallucinated-amount refusal are enforced,
+but the live run doesn't trigger either — because the agent behaves
+correctly. Given the schema up front it goes straight to `SELECT` and
+routes the write through `issue_refund`, and its figure matches the
+policy engine, so there is nothing to refuse.
+
+That is the intended outcome rather than a gap, and it *is* the
+argument: the guarantee is a Pydantic contract plus a `mode=ro`
+connection, not a prompt the model can outgrow. Both paths are proved
+deterministically offline — `test_mutations_are_blocked` (including
+stacked statements) and `test_agent_hallucinated_amount_is_refused`.
