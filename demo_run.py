@@ -9,7 +9,7 @@ TICKET: Asha Patel (gold tier), order #4711, mechanical keyboard
   Beat 4  RETRY STORM      - the same action replayed 3x, one refund
   Beat 5  memory           - new session, same actor, history recalled
 
-SAY THIS OUT LOUD WHILE RECORDING. Two guarantees are enforced here but
+Two guarantees are enforced here but
 do NOT fire on camera, because the agent behaves correctly:
 
   - The mutation block. The ticket asks the agent to "mark it refunded
