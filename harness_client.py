@@ -150,6 +150,10 @@ class Episode:
         self.text = ""
         self.meter = BudgetMeter(ExecutionBudget())
         self.started = time.time()
+        # Facts the store will return for this actor, measured after the
+        # episode. None means "not measured" -- distinct from 0, which is
+        # the isolation claim itself. See run_episode.
+        self.memory_facts: int | None = None
 
     @property
     def calls(self) -> list[str]:
@@ -192,6 +196,7 @@ class Episode:
     def to_record(self) -> dict:
         return {"task": self.task, "actor_id": self.actor_id,
                 "session_id": self.session_id, "trace": self.trace,
+                "memory_facts": self.memory_facts,
                 "stop_reasons": self.meter.stop_reasons,
                 "cost_usd": round(self.cost_usd, 4),
                 "duration_s": round(time.time() - self.started, 1),
@@ -222,6 +227,42 @@ def seed_calculator(client, session_id: str) -> None:
     )
 
 
+_MEMORY_ID: str | None = None
+
+
+def _memory_id() -> str:
+    """Resolve the managed memory store behind this harness, once."""
+    global _MEMORY_ID
+    if _MEMORY_ID is None:
+        ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
+        mem = ctl.get_harness(harnessId=HARNESS_ARN.split("/")[-1])["harness"]
+        arn = mem["memory"]["managedMemoryConfiguration"]["arn"]
+        _MEMORY_ID = arn.split("/")[-1]
+    return _MEMORY_ID
+
+
+def count_memory_facts(actor_id: str, limit: int = 100) -> int:
+    """How many extracted facts the store will return for this actor.
+
+    This is the mechanical form of the isolation claim. Asking the AGENT
+    what it remembers proves nothing: a cold-memory session happily says
+    "I don't retain any memory between sessions", which is a generic
+    disclaimer and, here, flatly untrue -- another actor recalled its
+    history seconds earlier. Query the retrieval layer instead and
+    compare counts. N against 0 is evidence; model self-report is not.
+
+    Counting stops at `limit`, which is fine for a comparison against
+    zero -- the assertion that matters is "nothing at all for that
+    actor", and no cap can hide a non-empty result.
+    """
+    data = boto3.client("bedrock-agentcore", region_name=REGION)
+    return len(data.list_memory_records(
+        memoryId=_memory_id(),
+        namespace=f"/actors/{actor_id}/facts/",
+        maxResults=limit,
+    )["memoryRecordSummaries"])
+
+
 def wait_for_memory(actor_id: str, timeout_s: int = 180) -> bool:
     """Block until managed memory has EXTRACTED facts for this actor.
 
@@ -231,19 +272,11 @@ def wait_for_memory(actor_id: str, timeout_s: int = 180) -> bool:
     there, the facts are not built yet. That reads on camera as broken
     memory, so wait for the extraction rather than for the clock.
     """
-    ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
-    data = boto3.client("bedrock-agentcore", region_name=REGION)
-    mem = ctl.get_harness(harnessId=HARNESS_ARN.split("/")[-1])["harness"]
-    mem_arn = mem["memory"]["managedMemoryConfiguration"]["arn"]
-    mem_id, namespace = mem_arn.split("/")[-1], f"/actors/{actor_id}/facts/"
-
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        found = data.list_memory_records(
-            memoryId=mem_id, namespace=namespace, maxResults=5
-        )["memoryRecordSummaries"]
+        found = count_memory_facts(actor_id)
         if found:
-            print(f"  [memory] {len(found)} fact(s) extracted for {actor_id}")
+            print(f"  [memory] {found} fact(s) extracted for {actor_id}")
             return True
         time.sleep(10)
     print(f"  [memory] no facts after {timeout_s}s -- recall may be cold")
@@ -263,6 +296,7 @@ def _drain(stream, ep: Episode):
     blocks: dict[int, dict] = {}      # contentBlockIndex -> gated call
     pending: list[dict] = []
     last_idx = 0
+    mid_line = False                  # streamed text without a trailing \n
     for event in stream:
         if "contentBlockStart" in event:
             block = event["contentBlockStart"]
@@ -286,9 +320,17 @@ def _drain(stream, ep: Episode):
             if "text" in delta:
                 ep.text += delta["text"]
                 print(delta["text"], end="", flush=True)
+                mid_line = not delta["text"].endswith("\n")
             if "toolUse" in delta and idx in blocks:
                 blocks[idx]["raw"] += delta["toolUse"].get("input", "")
         elif "messageStop" in event:
+            # Close the streamed line. Consecutive messages otherwise run
+            # together -- "**Reason:** damagedThe calculator returned" --
+            # which reads on camera as a rendering bug rather than as two
+            # turns of one conversation.
+            if mid_line:
+                print(flush=True)
+                mid_line = False
             ep.meter.record_stop_reason(
                 event["messageStop"].get("stopReason", "unknown"))
         elif "metadata" in event:
@@ -360,6 +402,23 @@ def run_episode(task: str, actor_id: str, session_id: str | None = None,
             {"role": "assistant", "content": tool_uses},
             {"role": "user", "content": tool_results},
         ])
+
+    # Record the retrieval-layer fact count on the episode itself, so the
+    # isolation evidence travels with the episode instead of only being
+    # printed by whoever happened to call count_memory_facts. This is the
+    # SAME measurement demo_run.py beat 6 makes; keeping it here means
+    # evals/test_trajectory.py reads it off the episode rather than
+    # scraping the model's text -- which is not evidence about the store.
+    #
+    # Never fatal: a memory store that cannot be queried is a missing
+    # measurement (None), not a failed episode. The eval distinguishes
+    # them, and a raise here would discard a completed trajectory.
+    try:
+        ep.memory_facts = count_memory_facts(actor_id)
+    except Exception as e:                              # noqa: BLE001
+        if verbose:
+            print(f"\n  [memory] fact count unavailable: "
+                  f"{type(e).__name__}: {e}")
 
     if verbose:
         print(f"\n--- episode: {len(ep.trace)} tool call(s) "

@@ -8,7 +8,7 @@ TICKET: Asha Patel (gold tier), order #4711, mechanical keyboard
   Beat 3  amount gate      - a wrong figure is refused, the right one collapses
   Beat 4  RETRY STORM      - the same action replayed 3x, one refund
   Beat 5  memory recall    - new session, same actor, history recalled
-  Beat 6  memory isolation - different actor, nothing carried across
+  Beat 6  memory isolation - N facts vs 0, measured at the store
 
 TWO BEATS ARE DRIVEN BY US, NOT BY THE AGENT: 1 and 3. That is
 deliberate, and worth saying out loud rather than glossing.
@@ -36,11 +36,12 @@ Usage:
 """
 import datetime
 import sqlite3
+import textwrap
 
 import gates
 import refund_calc
 from budget import EpisodeAborted
-from harness_client import run_episode, wait_for_memory
+from harness_client import count_memory_facts, run_episode, wait_for_memory
 from refund_ledger import RefundLedger
 # The SAME function objects the harness hands the agent's tool use to --
 # Beats 1 and 3 exercise the real contracts, not copies of them.
@@ -151,23 +152,42 @@ def show_amount_gate(days: int, correct: float) -> None:
     print("Direct calls into the same issue_refund the agent's tool use hits.\n")
     probes = [
         (999.00, "wildly wrong -- the classic hallucinated figure"),
-        (round(correct + 0.96, 2), "off by 96 cents -- a transcription slip"),
+        (round(correct + 0.96, 2),
+         "off by 96 cents -- the slip a human reviewer waves through"),
         (correct, "what the policy engine computes"),
     ]
+    indent = " " * 13
     for amount, note in probes:
         r = issue_refund({"order_id": ORDER_ID, "reason": "damaged",
                           "amount_usd": amount, "days_since_delivery": days})
         # Anything but the policy figure must be refused, every time.
         assert r["blocked"] is (amount != correct), \
             f"AMOUNT GATE MISBEHAVED at ${amount}: {r}"
+
         if r["blocked"]:
-            tag = "BLOCKED"
+            print(f"  ${amount:<9.2f} BLOCKED")
+            # The gate's own words are the point of this beat. Printing
+            # a bare "BLOCKED" throws away the sentence that shows WHY
+            # the refusal is trustworthy: it names both figures.
+            print(textwrap.fill(r["reason"], width=76,
+                                initial_indent=indent,
+                                subsequent_indent=indent))
         else:
             # Honest labelling: a duplicate is not a second commit, and
             # calling it one on camera invites exactly the wrong question.
-            tag = "DUPLICATE" if r.get("duplicate") else "COMMITTED"
-            tag += f"  key={r['idempotency_key'][:12]}..."
-        print(f"  ${amount:<9.2f} {tag}\n           {note}")
+            dup = r.get("duplicate")
+            tag = "DUPLICATE" if dup else "COMMITTED"
+            print(f"  ${amount:<9.2f} {tag}  "
+                  f"key={r['idempotency_key'][:12]}...")
+            if dup:
+                # Don't apologise for this -- it is beat 4's story
+                # arriving early, and it is true.
+                print(textwrap.fill(
+                    "The agent already committed this exact refund in beat 2. "
+                    "Same (order_id, reason, amount) -> same key, so this "
+                    "call collapses onto it. No second refund.",
+                    width=76, initial_indent=indent, subsequent_indent=indent))
+        print(f"{indent}^ {note}\n")
 
 
 def show_ledger(title: str) -> None:
@@ -185,41 +205,58 @@ def show_ledger(title: str) -> None:
 
 
 def show_isolation() -> None:
-    """Beat 6: a different actor carries nothing across.
+    """Beat 6: the memory store is scoped, proved at the RETRIEVAL layer.
 
-    Two distinct failures are possible here, and they are not the same
-    severity, so they are reported separately:
+    An earlier version asserted on what the model SAID. What it said was
+    "I don't retain any memory between sessions -- each conversation
+    starts fresh", which is a generic disclaimer and, here, flatly
+    untrue: CUST-100 recalled its history thirty seconds earlier. The
+    assertion passed, but it passed trivially. It proved the model
+    emitted innocuous text, not that the store was scoped -- and the
+    store being scoped is the one security invariant in this demo.
 
-    1. MEMORY LEAK -- the agent recalls CUST-100's refund with no tool
-       calls. That breaks the actorId guarantee. Hard assert.
-    2. LEDGER READ -- the agent SELECTs refund_intents and finds 4711
-       anyway, because the table is not row-level scoped. The guarantee
-       this beat is about still holds, but the take is unusable: the
-       screen shows one customer being handed another's refund. Loud
-       warning, no assert, because the demo should finish.
+    So the proof moved down a layer. Count what memory will actually
+    return for each actor and compare. N against 0 is mechanical
+    evidence; what the model then says about its own memory becomes
+    irrelevant, which is exactly the point -- we are not taking the
+    model's self-report as testimony about the system it runs on.
 
-    Asserting on the text alone would conflate the two and blame memory
-    for a SQL read -- on camera, wrongly.
+    The episode still runs afterwards, because a second failure mode
+    survives a perfectly scoped memory store: the agent can SELECT
+    refund_intents and read another customer's refund straight out of
+    the database. That is not a memory leak and is not asserted here --
+    it is gap #5 -- but it ruins the take, so it warns loudly.
     """
     print("\n===== BEAT 6: NEW CUSTOMER, NOTHING CARRIED ACROSS =====")
+
+    # ---- the actual proof, before the model gets a word in ----
+    mine = count_memory_facts(ACTOR)
+    theirs = count_memory_facts(OTHER_ACTOR)
+    print(f"  [memory] {mine} fact(s) retrieved for {ACTOR}")
+    print(f"  [memory] {theirs} fact(s) retrieved for {OTHER_ACTOR}")
+
+    # Both halves matter: "0 for them" only means something if the
+    # store had something to leak in the first place.
+    assert mine > 0, (
+        f"NO BASELINE: {ACTOR} has no facts either, so 0 for "
+        f"{OTHER_ACTOR} proves nothing -- extraction may simply be cold")
+    assert theirs == 0, (
+        f"MEMORY LEAK: {OTHER_ACTOR} retrieved {theirs} fact(s); "
+        "the actorId namespace did not isolate them")
+    print(f"  -> {mine} vs 0 across the actorId boundary, measured at the "
+          "store, not inferred from the answer\n")
+
     other = run_episode(OTHER_TICKET, actor_id=OTHER_ACTOR)
-    exposed = "172.03" in other.text or str(ORDER_ID) in other.text
-
-    assert not (exposed and not other.calls), (
-        f"MEMORY LEAK: {OTHER_ACTOR} recalled {ACTOR}'s refund "
-        "with zero tool calls -- the actorId boundary did not hold")
-
-    if exposed:
-        print(f"\n  !! RETAKE: order {ORDER_ID} appears in the answer. The "
-              f"agent reached it via {other.calls},")
-        print("     so memory isolation held -- but the screen still shows "
-              "another customer's refund.")
+    if "172.03" in other.text or str(ORDER_ID) in other.text:
+        print(f"\n  !! RETAKE: order {ORDER_ID} appears in the answer. Memory "
+              f"is provably clean (0 facts), so the agent")
+        print(f"     reached it via {other.calls} -- a database read, not "
+              "recall.")
         print("     Cause: refund_intents has no row-level scoping. See "
-              "code_readme.md, known gaps.")
+              "code_readme.md, gap #5.")
     else:
-        print(f"  isolation holds: {OTHER_ACTOR} recalls nothing from {ACTOR}")
-        print(f"                   ({len(other.calls)} tool call(s); the "
-              "ledger was never consulted)")
+        print(f"  the answer agrees with the measurement: no trace of "
+              f"{ACTOR} in it")
 
 
 if __name__ == "__main__":

@@ -123,10 +123,17 @@ def issue_refund(payload: dict) -> dict:
 
     expected_total = Decimal(expected["total"])
     if abs(req.amount_usd - expected_total) > CENT:
+        # Quantize for display. Pydantic hands us the agent's figure as
+        # Decimal("999.0") when the JSON carried 999.0, and "$999.0"
+        # beside a correctly-formed "$172.03" reads as a bug in the
+        # refusal -- in the one message that has to look authoritative.
+        # money() is the repo's canonical cent quantizer, so no float
+        # ever enters the money path, not even to print it.
         return {"blocked": True,
                 "reason": ("Gate: amount mismatch. Agent reported "
-                           f"${req.amount_usd}, policy computes "
-                           f"${expected_total}. Refusing to move money."),
+                           f"${refund_calc.money(req.amount_usd)}, policy "
+                           f"computes ${refund_calc.money(expected_total)}. "
+                           "Refusing to move money."),
                 "policy": expected}
 
     # GATE 3 - IDEMPOTENCY. Semantic key, enforced by a PRIMARY KEY.

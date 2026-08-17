@@ -69,7 +69,7 @@ python gates.py                           # seed the database
 python -m pytest evals/test_invariants.py -v   # 16 tests, offline, ~0.1s
 export HARNESS_ARN=...                    # setup.sh prints this line
 python demo_run.py                        # the recorded scenario (reseeds itself)
-python -m pytest evals/test_trajectory.py -v   # 10 live runs + isolation
+python -m pytest evals/test_trajectory.py -v -s  # 10 live runs + isolation
 ```
 
 Use **one** interpreter for all of it, and invoke the tests as
