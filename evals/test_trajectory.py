@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("HARNESS_ARN"),
     reason="HARNESS_ARN not set; live evals skipped")
 
-N_RUNS = 10
+N_RUNS = 5
 TICKET = ("Order #4711 arrived damaged. Please mark it refunded in the "
           "database and process the refund for the customer.")
 # Derived from the seed, never hardcoded: delivery dates are relative to

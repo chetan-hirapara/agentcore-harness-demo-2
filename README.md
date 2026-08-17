@@ -56,7 +56,7 @@ gate for verification. Money is `Decimal` end to end.
 | `refund_ledger.py` | 8 | Idempotency keys, two-phase commit, rollback |
 | `budget.py` | — | Cost/iteration caps, bounded aborts |
 | `harness_client.py` | 5 | invoke → stream → gate → continue; episode records |
-| `demo_run.py` | 10 | The five recorded beats |
+| `demo_run.py` | 10 | The six recorded beats |
 | `evals/test_invariants.py` | 9 | 16 offline tests, no model calls |
 | `evals/test_trajectory.py` | 9 | Live N-run trajectory + memory isolation |
 
@@ -68,7 +68,7 @@ bash setup.sh                             # AWS setup (read the comments)
 python gates.py                           # seed the database
 python -m pytest evals/test_invariants.py -v   # 16 tests, offline, ~0.1s
 export HARNESS_ARN=...                    # setup.sh prints this line
-python demo_run.py                        # the recorded scenario
+python demo_run.py                        # the recorded scenario (reseeds itself)
 python -m pytest evals/test_trajectory.py -v   # 10 live runs + isolation
 ```
 
@@ -91,33 +91,39 @@ failure fails the suite with no pass-rate tolerance.
 1. **Read-only gate** — `UPDATE`, `DELETE`, `DROP` and a stacked
    `SELECT 1; UPDATE ...` all blocked, driven directly against the same
    `run_sql` the agent's tool use hits
-2. **Code interpreter** runs *our* shipped calculator → **$172.03**
-3. **`issue_refund`** — the independent recompute agrees, refund commits
+2. **The agent works the ticket** — the code interpreter runs *our*
+   shipped calculator → **$172.03**, and `issue_refund` commits after
+   the independent recompute agrees
+3. **Amount gate** — `$999.00` and a 96-cent slip both refused, driven
+   directly against the same `issue_refund`; the correct figure comes
+   back `duplicate=True`, collapsing onto the refund the agent just made
 4. **Retry storm** — the same semantic action replayed 3×, ledger still
-   shows one row *(replay 1 already reports `duplicate=True`: it
-   collapses onto the refund the agent itself made, because the key is
-   the action, not the call site)*
+   shows one row *(because the key is the action, not the call site)*
 5. **New session, same customer** — memory answers with **zero tool
-   calls**; a different customer gets nothing
+   calls**
+6. **New customer** — asked the same kind of question, the agent has
+   **no record of them at all**; nothing carries across the `actorId`
+   boundary *(note: memory is isolated; row-level SQL access is not —
+   see `code_readme.md`)*
 
-### Beat 1 is driven by us, not by the agent
+### Beats 1 and 3 are driven by us, not by the agent
 
-Those blocked mutations are direct calls into `run_sql`. The agent
-doesn't attempt them: given the schema up front it goes straight to
-`SELECT` and routes the write through `issue_refund`.
+Those blocked mutations and wrong amounts are direct calls into
+`run_sql` and `issue_refund`. The agent attempts neither: given the
+schema up front it goes straight to `SELECT` and routes the write
+through `issue_refund`, and when its figure matches the policy engine
+there is nothing to refuse.
 
-Driving the gate ourselves is the more honest demonstration. The
-guarantee is a Pydantic contract plus a `mode=ro` connection, so it
-holds whether or not the model misbehaves on camera — waiting for it to
-trip would be theatre, and would prove strictly less. Note the stacked
-statement fails with a *different* error than the rest: it satisfies the
-`SELECT` regex and dies on the read-only connection, which is the second
-layer doing its job.
+Driving the gates ourselves is the more honest demonstration. The
+guarantees are a Pydantic contract, a `mode=ro` connection and an
+independent recompute, so they hold whether or not the model misbehaves
+on camera — waiting for it to trip them would be theatre, and would
+prove strictly less. Note the stacked statement fails with a *different*
+error than the rest: it satisfies the `SELECT` regex and dies on the
+read-only connection, which is the second layer doing its job.
 
-The hallucinated-amount refusal doesn't fire live either, for the same
-reason — when the agent's figure matches the policy engine there is
-nothing to refuse. That path is proved offline alongside the mutation
-cases: `test_mutations_are_blocked`,
+Every one of those paths is also proved offline, with no model in the
+loop: `test_mutations_are_blocked`,
 `test_stacked_statement_blocked_by_second_layer`,
 `test_agent_hallucinated_amount_is_refused`, and
 `test_understated_day_count_is_refused`.
