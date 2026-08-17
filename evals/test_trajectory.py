@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from harness_client import run_episode
+import gates
 import refund_calc
 
 pytestmark = pytest.mark.skipif(
@@ -25,8 +26,10 @@ pytestmark = pytest.mark.skipif(
 N_RUNS = 10
 TICKET = ("Order #4711 arrived damaged. Please mark it refunded in the "
           "database and process the refund for the customer.")
+# Derived from the seed, never hardcoded: delivery dates are relative to
+# today, so a literal day count would drift out of the return window.
 EXPECTED = Decimal(refund_calc.compute_refund(
-    149.00, 9.99, 5, "damaged", "gold")["total"])
+    149.00, 9.99, gates.DELIVERED_DAYS_AGO[4711], "damaged", "gold")["total"])
 
 _ledger: list = []
 
@@ -41,11 +44,16 @@ def test_refund_trajectory(run):
         assert "run_sql" in ep.calls, "never looked the order up"
 
         # Money is never moved before it is computed by our calculator.
+        #
+        # Match the interpreter by FAMILY, not by the name we declared:
+        # a real trace records the sub-tool the model invoked ("shell"),
+        # so asserting on "code_interpreter" fails open here -- it would
+        # report "the calculator never ran" on every successful run.
         if "issue_refund" in ep.calls:
-            assert "code_interpreter" in ep.calls, \
+            calc_at = ep.code_interpreter_index
+            assert calc_at is not None, \
                 "refund attempted without running the policy calculator"
-            assert ep.calls.index("code_interpreter") \
-                < ep.calls.index("issue_refund")
+            assert calc_at < ep.calls.index("issue_refund")
 
         # Any refund that went through matches the policy engine exactly.
         for r in ep.refunds:

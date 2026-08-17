@@ -13,6 +13,7 @@ Two tools, two risk tiers:
                                      idempotency key + two-phase commit
 """
 import sqlite3
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
@@ -22,6 +23,11 @@ from refund_ledger import RefundLedger, idempotency_key
 
 DB_PATH = "demo_orders.db"
 CENT = Decimal("0.01")
+
+# Slack on the derived day count, for clock skew and timezone edges
+# between whoever computed the date and this process. One day, not two:
+# the tolerance exists to absorb midnight, not to excuse a guess.
+DAY_TOLERANCE = 1
 
 # Set True to demonstrate rollback: the effect is applied, then the
 # commit fails, and the compensating action reverses it.
@@ -84,10 +90,29 @@ def issue_refund(payload: dict) -> dict:
     # GATE 2 - INDEPENDENT RECOMPUTE. We never trust a number the model
     # reports back to us, even one the sandbox produced: the model is
     # what transcribed it.
+    #
+    # That includes the DAY COUNT, and this is the input that matters
+    # most, because days_since_delivery is what decides eligibility.
+    # Recomputing the total from a reported day count checks the
+    # arithmetic but not the decision: an agent claiming "5 days" for a
+    # year-old order would get a refund the policy owes nobody, and
+    # every figure in it would reconcile. So derive it from
+    # orders.delivered_on, and refuse on disagreement exactly as we do
+    # for the amount.
+    actual_days = refund_calc.days_since_delivery(order["delivered_on"])
+    if abs(req.days_since_delivery - actual_days) > DAY_TOLERANCE:
+        return {"blocked": True,
+                "reason": ("Gate: day-count mismatch. Agent reported "
+                           f"{req.days_since_delivery} days since delivery; "
+                           f"orders.delivered_on ({order['delivered_on']}) "
+                           f"gives {actual_days}. Refusing to move money."),
+                "fix": [{"field": ["days_since_delivery"],
+                         "problem": f"must be {actual_days} for this order"}]}
+
     expected = refund_calc.compute_refund(
         item_price=order["amount_usd"],
         shipping_paid=order["shipping_usd"],
-        days_since_delivery=req.days_since_delivery,
+        days_since_delivery=actual_days,      # derived, not reported
         reason=req.reason,
         tier=order["tier"],
     )
@@ -145,7 +170,7 @@ def _load_order(order_id: int) -> dict | None:
     try:
         cur = conn.execute(
             "SELECT o.order_id, o.customer_id, o.amount_usd, o.shipping_usd, "
-            "o.status, c.tier FROM orders o JOIN customers c "
+            "o.delivered_on, o.status, c.tier FROM orders o JOIN customers c "
             "ON c.customer_id = o.customer_id WHERE o.order_id = ?",
             (order_id,))
         cols = [d[0] for d in cur.description]
@@ -153,6 +178,19 @@ def _load_order(order_id: int) -> dict | None:
         return dict(zip(cols, row)) if row else None
     finally:
         conn.close()
+
+
+# Delivery dates are seeded RELATIVE TO TODAY, never hardcoded. A fixed
+# date is a time bomb against a 30-day return window: the demo works the
+# week it is written and starts answering OUTSIDE_RETURN_WINDOW a month
+# later, on camera, correctly, for a reason nobody in the room will
+# guess. 4712 is deliberately stale -- an ineligible order to query.
+DELIVERED_DAYS_AGO = {4711: 2, 4712: 227, 4713: 5, 4801: 3, 4802: 2}
+
+
+def _delivered_on(order_id: int, today: date | None = None) -> str:
+    d = (today or date.today()) - timedelta(days=DELIVERED_DAYS_AGO[order_id])
+    return d.isoformat()
 
 
 def seed_demo_db() -> None:
@@ -192,22 +230,23 @@ def seed_demo_db() -> None:
             ('CUST-100', 'Asha Patel',  'gold'),
             ('CUST-200', 'Diego Ramos', 'standard'),
             ('CUST-300', 'Liu Wei',    'platinum');
-
-        INSERT INTO orders VALUES
-            (4711, 'CUST-100', 'Mechanical keyboard', 149.00, 9.99,
-             '2026-08-15', 'delivered'),
-            (4712, 'CUST-200', 'USB-C dock',           89.50, 5.99,
-             '2026-01-02', 'delivered'),
-            (4713, 'CUST-100', 'Monitor arm',          59.99, 0.00,
-             '2026-02-10', 'delivered'),
-            (4801, 'CUST-200', 'Laptop stand',         39.99, 4.99,
-             '2026-02-15', 'delivered'),
-            (4802, 'CUST-300', 'Wireless mouse',      29.99, 3.99,
-             '2026-02-16', 'delivered');
     """)
+    conn.executemany(
+        "INSERT INTO orders VALUES (?,?,?,?,?,?,?)",
+        [(oid, cust, item, price, ship, _delivered_on(oid), "delivered")
+         for oid, cust, item, price, ship in (
+             (4711, 'CUST-100', 'Mechanical keyboard', 149.00, 9.99),
+             (4712, 'CUST-200', 'USB-C dock',           89.50, 5.99),
+             (4713, 'CUST-100', 'Monitor arm',          59.99, 0.00),
+             (4801, 'CUST-200', 'Laptop stand',         39.99, 4.99),
+             (4802, 'CUST-300', 'Wireless mouse',       29.99, 3.99),
+         )])
     conn.commit()
     conn.close()
-    print(f"Seeded {DB_PATH}: 3 customers, 5 orders, empty refund ledger.")
+    print(f"Seeded {DB_PATH}: 3 customers, 5 orders, empty refund ledger. "
+          f"Order 4711 delivered {_delivered_on(4711)} "
+          f"({DELIVERED_DAYS_AGO[4711]}d ago, inside the "
+          f"{refund_calc.RETURN_WINDOW_DAYS}d window).")
 
 
 if __name__ == "__main__":

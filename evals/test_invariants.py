@@ -30,12 +30,16 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 # Derived, never hardcoded: order 4711 is $149.00 + $9.99 shipping,
-# gold tier, damaged, 5 days after delivery.
+# gold tier, damaged. The day count comes from the seed, which sets
+# delivery dates relative to today -- a literal here would drift out of
+# the return window and fail for the wrong reason a month from now.
+DAYS_4711 = gates.DELIVERED_DAYS_AGO[4711]
 CORRECT_TOTAL = float(refund_calc.compute_refund(
-    149.00, 9.99, 5, "damaged", "gold")["total"])
+    149.00, 9.99, DAYS_4711, "damaged", "gold")["total"])
 
 REFUND_4711 = {"order_id": 4711, "reason": "damaged",
-               "amount_usd": CORRECT_TOTAL, "days_since_delivery": 5}
+               "amount_usd": CORRECT_TOTAL,
+               "days_since_delivery": DAYS_4711}
 
 
 # ---------------------------------------------------- read-only gate
@@ -84,6 +88,46 @@ def test_agent_hallucinated_amount_is_refused():
     r = gates.issue_refund(bad)
     assert r["blocked"] is True and "mismatch" in r["reason"].lower()
     assert RefundLedger().all_intents() == []      # nothing reserved
+
+
+def test_understated_day_count_is_refused():
+    """Order 4712 was delivered well outside the return window. An agent
+    that reports a small day count would otherwise be refunded on a
+    total that reconciles perfectly -- the arithmetic was never the lie."""
+    # The amount an in-window 4712 WOULD earn, so only the days are wrong.
+    plausible = float(refund_calc.compute_refund(
+        89.50, 5.99, 5, "damaged", "standard")["total"])
+    r = gates.issue_refund({"order_id": 4712, "reason": "damaged",
+                            "amount_usd": plausible,
+                            "days_since_delivery": 5})
+    assert r["blocked"] is True
+    assert "day-count mismatch" in r["reason"].lower()
+    assert RefundLedger().all_intents() == []      # nothing reserved
+
+
+def test_day_count_is_derived_from_the_order_not_the_agent():
+    """Eligibility is decided by OUR reading of orders.delivered_on."""
+    order = gates._load_order(4712)
+    actual = refund_calc.days_since_delivery(order["delivered_on"])
+    assert actual == gates.DELIVERED_DAYS_AGO[4712] > refund_calc.RETURN_WINDOW_DAYS
+
+    # Honest day count on a stale order: refused on policy, not on the
+    # mismatch -- a different gate, and it must still stop the money.
+    r = gates.issue_refund({"order_id": 4712, "reason": "damaged",
+                            "amount_usd": 0.00, "days_since_delivery": actual})
+    assert r["blocked"] is True
+    assert r["policy"]["reason_code"] == "OUTSIDE_RETURN_WINDOW"
+
+
+def test_day_count_tolerates_clock_skew():
+    """One day of slack absorbs midnight and timezones; it does not
+    excuse a guess."""
+    ok = dict(REFUND_4711, days_since_delivery=DAYS_4711 + gates.DAY_TOLERANCE)
+    assert gates.issue_refund(ok)["blocked"] is False
+
+    off = dict(REFUND_4711,
+               days_since_delivery=DAYS_4711 + gates.DAY_TOLERANCE + 1)
+    assert gates.issue_refund(off)["blocked"] is True
 
 
 # ------------------------------------------------------- idempotency

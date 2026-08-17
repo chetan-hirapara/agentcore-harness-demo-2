@@ -23,6 +23,8 @@ import os
 import sqlite3
 import time
 import uuid
+from datetime import date
+
 import boto3
 
 from budget import ExecutionBudget, BudgetMeter, EpisodeAborted
@@ -34,6 +36,15 @@ CALC_REMOTE_PATH = "/tmp/refund_calc.py"
 
 # Tools we gate ourselves. The harness pauses for these.
 GATED_TOOLS = {"run_sql": run_sql, "issue_refund": issue_refund}
+
+# We DECLARE the code interpreter as "code_interpreter"; the harness
+# reports the sub-tool the model actually invoked, which is "shell".
+# Asserting on the declared name therefore never matches a real trace --
+# it fails open in evals and reads as "the calculator never ran". Match
+# on the family instead, and keep the raw name in the trace so the
+# audit record still says what happened.
+CODE_INTERPRETER_TOOLS = {"code_interpreter", "shell",
+                          "execute_code", "read_files", "write_files"}
 
 TOOLS = [
     {"type": "inline_function", "name": "run_sql",
@@ -111,8 +122,12 @@ SYSTEM_PROMPT = [{"text": (
     "names, and do not try to discover them: run_sql permits SELECT "
     "only, so PRAGMA and other introspection are blocked.\n"
     f"{_schema_card()}\n"
-    "orders.delivered_on is 'YYYY-MM-DD'; days_since_delivery is "
-    "measured from it to today. customers.tier is one of gold, "
+    f"Today's date is {date.today().isoformat()}. Use it -- do not "
+    "assume a date from your training. orders.delivered_on is "
+    "'YYYY-MM-DD'; days_since_delivery is the number of days from it to "
+    "today, and the gate recomputes it from the row before issuing any "
+    "refund, so a guess is refused rather than quietly accepted. "
+    "customers.tier is one of gold, "
     "standard, platinum. refund_intents is the committed-refund ledger "
     "and has no reason column -- join it to orders on order_id.\n\n"
     "The caller is ALREADY AUTHENTICATED. The session is bound to one "
@@ -152,6 +167,23 @@ class Episode:
     def refunds(self) -> list[dict]:
         return [t for t in self.gated_calls if t["tool"] == "issue_refund"
                 and not t["result"].get("blocked")]
+
+    def first_index(self, *names: str) -> int | None:
+        """Index in `calls` of the first call to any of `names`, or None.
+
+        Used instead of `calls.index(...)` so the ordering invariant
+        ("money is never moved before it is computed") can be stated
+        over a FAMILY of tool names -- see CODE_INTERPRETER_TOOLS -- and
+        returns None rather than raising when the tool never ran.
+        """
+        for i, call in enumerate(self.calls):
+            if call in names:
+                return i
+        return None
+
+    @property
+    def code_interpreter_index(self) -> int | None:
+        return self.first_index(*CODE_INTERPRETER_TOOLS)
 
     @property
     def cost_usd(self) -> float:

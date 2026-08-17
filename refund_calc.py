@@ -15,6 +15,7 @@ a style preference: 0.1 + 0.2 != 0.3, and a refund is a legal record.
 """
 import argparse
 import json
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
 POLICY_VERSION = "2026.02"
@@ -33,6 +34,17 @@ TAX_RATE = Decimal("0.0875")
 
 def money(x) -> Decimal:
     return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def days_since_delivery(delivered_on: str, today: date | None = None) -> int:
+    """Calendar days from an ISO 'YYYY-MM-DD' delivery date to today.
+
+    Lives here, beside RETURN_WINDOW_DAYS, because eligibility is a
+    policy question. gates.py derives this number from the orders table
+    instead of trusting the one the model reports -- otherwise the
+    recompute checks the arithmetic but not the decision.
+    """
+    return ((today or date.today()) - date.fromisoformat(delivered_on)).days
 
 
 def compute_refund(item_price, shipping_paid, days_since_delivery,

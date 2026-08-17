@@ -122,13 +122,20 @@ if __name__ == "__main__":
         # code path, same (order_id, reason, amount) -- so the ledger
         # cannot tell them apart, which is the property being shown.
         print("\n===== BEAT 4: RETRY STORM (3 replays) =====")
-        from gates import issue_refund
+        from gates import issue_refund, _load_order
         import refund_calc
+        # Read the order and derive both figures, exactly as the gate
+        # does. Hardcoding either one makes the replay a different
+        # action than the agent's, and the storm stops colliding.
+        order = _load_order(4711)
+        days = refund_calc.days_since_delivery(order["delivered_on"])
         correct = float(refund_calc.compute_refund(
-            149.00, 9.99, 5, "damaged", "gold")["total"])
+            order["amount_usd"], order["shipping_usd"], days,
+            "damaged", order["tier"])["total"])
         for i in range(3):
             r = issue_refund({"order_id": 4711, "reason": "damaged",
-                              "amount_usd": correct, "days_since_delivery": 5})
+                              "amount_usd": correct,
+                              "days_since_delivery": days})
             print(f"  replay {i+1}: duplicate={r.get('duplicate')} "
                   f"key={r.get('idempotency_key', '')[:12]}... "
                   f"state={r.get('state')}")

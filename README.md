@@ -29,7 +29,11 @@ cannot be prompt-injected or argued with.
 1. **Schema** — Pydantic contract on the tool boundary.
 2. **Independent recompute** — we re-run the policy engine ourselves and
    refuse on any disagreement with the agent's figure. *The model is
-   what transcribed the number, so the number is not trusted.*
+   what transcribed the number, so the number is not trusted.* That
+   includes `days_since_delivery`, which is derived from
+   `orders.delivered_on` rather than believed: it is the input that
+   decides eligibility, so trusting it would recompute the arithmetic
+   but not the decision.
 3. **Idempotency** — key is a hash of the semantic action
    `(order_id, reason, amount)`, and it's the `PRIMARY KEY` of
    `refund_intents`. The guarantee is a database uniqueness
@@ -53,7 +57,7 @@ gate for verification. Money is `Decimal` end to end.
 | `budget.py` | — | Cost/iteration caps, bounded aborts |
 | `harness_client.py` | 5 | invoke → stream → gate → continue; episode records |
 | `demo_run.py` | 10 | The five recorded beats |
-| `evals/test_invariants.py` | 9 | 13 offline tests, no model calls |
+| `evals/test_invariants.py` | 9 | 16 offline tests, no model calls |
 | `evals/test_trajectory.py` | 9 | Live N-run trajectory + memory isolation |
 
 ## Run it
@@ -62,7 +66,7 @@ gate for verification. Money is `Decimal` end to end.
 python -m pip install boto3 pydantic pytest
 bash setup.sh                             # AWS setup (read the comments)
 python gates.py                           # seed the database
-python -m pytest evals/test_invariants.py -v   # 13 tests, offline, ~0.2s
+python -m pytest evals/test_invariants.py -v   # 16 tests, offline, ~0.1s
 export HARNESS_ARN=...                    # setup.sh prints this line
 python demo_run.py                        # the recorded scenario
 python -m pytest evals/test_trajectory.py -v   # 10 live runs + isolation
@@ -114,5 +118,6 @@ The hallucinated-amount refusal doesn't fire live either, for the same
 reason — when the agent's figure matches the policy engine there is
 nothing to refuse. That path is proved offline alongside the mutation
 cases: `test_mutations_are_blocked`,
-`test_stacked_statement_blocked_by_second_layer`, and
-`test_agent_hallucinated_amount_is_refused`.
+`test_stacked_statement_blocked_by_second_layer`,
+`test_agent_hallucinated_amount_is_refused`, and
+`test_understated_day_count_is_refused`.
