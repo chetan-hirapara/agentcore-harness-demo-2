@@ -5,4 +5,5 @@
 
 boto3>=1.40,<2          # bedrock-agentcore + bedrock-agentcore-control
 pydantic>=2.7,<3        # the tool-boundary contracts in gates.py
+websockets>=15          # harness shell, used to seed the calculator
 pytest>=8.0             # evals/ (tier 1 offline, tier 2 live)

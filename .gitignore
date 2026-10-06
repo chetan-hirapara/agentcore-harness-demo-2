@@ -14,3 +14,15 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Credentials and local config
+.env
+.env.*
+*.pem
+
+# Tool caches and editor state
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+Thumbs.db

@@ -18,20 +18,29 @@ Everything else runs server-side where AWS handles isolation.
 Memory is scoped by actorId. Two customers share nothing, and the
 isolation is asserted in evals/test_trajectory.py.
 """
+import asyncio
+import base64
 import json
 import os
 import sqlite3
 import time
+import urllib.parse
 import uuid
 from datetime import date
 
 import boto3
+import botocore.session
+import websockets
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 
 from budget import ExecutionBudget, BudgetMeter, EpisodeAborted
 from gates import run_sql, issue_refund, DB_PATH
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-HARNESS_ARN = os.environ.get("HARNESS_ARN", "")
+# HARNESS_ARN = os.environ.get("HARNESS_ARN", "").strip()
+# HARNESS_ARN = "arn:aws:bedrock-agentcore:us-east-1:058264121536:harness/support_agent-tI2732hswg"
+HARNESS_ARN = (os.popen("aws bedrock-agentcore-control list-harnesses --query \"harnesses[?harnessName=='support_agent'].arn | [0]\" --output text").read().strip())
 CALC_REMOTE_PATH = "/tmp/refund_calc.py"
 
 # Tools we gate ourselves. The harness pauses for these.
@@ -210,34 +219,72 @@ class Episode:
         return path
 
 
-def seed_calculator(client, session_id: str) -> None:
+async def _shell_exec_async(session_id: str, script: str) -> None:
+    if not HARNESS_ARN:
+        raise RuntimeError("HARNESS_ARN is not set")
+    host = f"bedrock-agentcore.{REGION}.amazonaws.com"
+    path = f"/runtimes/{urllib.parse.quote(HARNESS_ARN, safe='')}/ws/shells"
+    request = AWSRequest(method="GET", url=f"https://{host}{path}", headers={
+        "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id})
+    SigV4Auth(botocore.session.Session().get_credentials(),
+              "bedrock-agentcore", REGION).add_auth(request)
+
+    data = script.encode()
+    async with websockets.connect(
+            f"wss://{host}{path}", additional_headers=dict(request.headers),
+            subprotocols=["v1.command.agentcore.aws.dev"],
+            open_timeout=330) as ws:
+        # Frames are capped at 64 KB.
+        for i in range(0, len(data), 16 * 1024):
+            await ws.send(b"\x00" + data[i:i + 16 * 1024])
+        async for frame in ws:
+            if isinstance(frame, bytes) and frame[:1] == b"\x03":
+                status = json.loads(frame[1:])
+                for cause in status.get("details", {}).get("causes", []):
+                    if cause.get("reason") == "ExitCode":
+                        raise RuntimeError(f"seeding failed: {status}")
+
+
+def _shell_exec(session_id: str, script: str) -> None:
+    """Run a bash script in the harness session's microVM, no model involved."""
+    asyncio.run(asyncio.wait_for(_shell_exec_async(session_id, script), 360))
+
+
+def seed_calculator(session_id: str) -> None:
     """Put OUR calculator on the microVM before the agent reasons.
 
-    Lab 07: InvokeAgentRuntimeCommand runs on the VM without the model
-    in the loop. This is the whole point -- the policy engine is
-    shipped, not model-generated. A sandbox does not make arithmetic
-    deterministic if the model writes the arithmetic.
+    The policy engine is shipped, not model-generated: a sandbox does not
+    make arithmetic deterministic if the model writes the arithmetic.
+    Harness sessions only expose the shell WebSocket (InvokeAgentRuntimeCommand
+    rejects harness ARNs with a 404), so the file travels as base64 lines
+    short enough for the PTY's line buffer.
     """
-    source = open("refund_calc.py").read()
-    heredoc = f"cat > {CALC_REMOTE_PATH} <<'PYEOF'\n{source}\nPYEOF"
-    client.invoke_agent_runtime_command(
-        agentRuntimeArn=HARNESS_ARN,
-        runtimeSessionId=session_id,
-        body={"command": heredoc},
-    )
+    with open("refund_calc.py", "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    lines = "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))
+    _shell_exec(session_id,
+                f"stty -echo; base64 -d > {CALC_REMOTE_PATH} <<'B64'\n"
+                f"{lines}\nB64\ntest -s {CALC_REMOTE_PATH}\nexit\n")
 
 
 _MEMORY_ID: str | None = None
+_FACT_STRATEGY_ID: str | None = None
 
 
 def _memory_id() -> str:
-    """Resolve the managed memory store behind this harness, once."""
-    global _MEMORY_ID
+    """Resolve the memory store behind this harness and its fact strategy, once."""
+    global _MEMORY_ID, _FACT_STRATEGY_ID
     if _MEMORY_ID is None:
         ctl = boto3.client("bedrock-agentcore-control", region_name=REGION)
-        mem = ctl.get_harness(harnessId=HARNESS_ARN.split("/")[-1])["harness"]
-        arn = mem["memory"]["managedMemoryConfiguration"]["arn"]
-        _MEMORY_ID = arn.split("/")[-1]
+        memory = ctl.get_harness(
+            harnessId=HARNESS_ARN.split("/")[-1])["harness"]["memory"]
+        cfg = (memory.get("agentCoreMemoryConfiguration")
+               or memory["managedMemoryConfiguration"])
+        memory_id = cfg["arn"].split("/")[-1]
+        strategies = ctl.get_memory(memoryId=memory_id)["memory"]["strategies"]
+        _FACT_STRATEGY_ID = next(s["strategyId"] for s in strategies
+                                 if s["type"] == "SEMANTIC")
+        _MEMORY_ID = memory_id
     return _MEMORY_ID
 
 
@@ -256,14 +303,15 @@ def count_memory_facts(actor_id: str, limit: int = 100) -> int:
     actor", and no cap can hide a non-empty result.
     """
     data = boto3.client("bedrock-agentcore", region_name=REGION)
+    memory_id = _memory_id()
     return len(data.list_memory_records(
-        memoryId=_memory_id(),
-        namespace=f"/actors/{actor_id}/facts/",
+        memoryId=memory_id,
+        namespace=f"/strategies/{_FACT_STRATEGY_ID}/actors/{actor_id}/",
         maxResults=limit,
     )["memoryRecordSummaries"])
 
 
-def wait_for_memory(actor_id: str, timeout_s: int = 180) -> bool:
+def wait_for_memory(actor_id: str, timeout_s: int = 600) -> bool:
     """Block until managed memory has EXTRACTED facts for this actor.
 
     Writing events is synchronous; extracting them into semantic records
@@ -354,7 +402,7 @@ def run_episode(task: str, actor_id: str, session_id: str | None = None,
     if session_id:
         ep.session_id = session_id
 
-    seed_calculator(client, ep.session_id)
+    seed_calculator(ep.session_id)
 
     kwargs = dict(
         harnessArn=HARNESS_ARN,

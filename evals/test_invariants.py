@@ -6,6 +6,7 @@ live in test_trajectory.py and run on a schedule, not on every push.
 
 Run:  pytest evals/test_invariants.py -v
 """
+import base64
 import json
 import os
 import sys
@@ -219,7 +220,12 @@ class _FakeControl:
     def get_harness(self, harnessId):          # noqa: N803 - boto3 casing
         self.get_harness_calls += 1
         return {"harness": {"memory": {
-            "managedMemoryConfiguration": {"arn": MEMORY_ARN}}}}
+            "agentCoreMemoryConfiguration": {"arn": MEMORY_ARN}}}}
+
+    def get_memory(self, memoryId):            # noqa: N803 - boto3 casing
+        return {"memory": {"strategies": [
+            {"strategyId": "summary-1", "type": "SUMMARIZATION"},
+            {"strategyId": "semantic-1", "type": "SEMANTIC"}]}}
 
 
 class _FakeAgentCore:
@@ -232,11 +238,6 @@ class _FakeAgentCore:
         self.log = []                          # every call, in order
         self.commands = []
         self.memory_queries = []
-
-    def invoke_agent_runtime_command(self, **kw):
-        self.log.append("command")
-        self.commands.append(kw)
-        return {}
 
     def invoke_harness(self, **kw):
         self.log.append("invoke")
@@ -299,6 +300,12 @@ def harness(monkeypatch):
     monkeypatch.setattr(harness_client, "HARNESS_ARN", HARNESS_ARN)
     # Resolved once per PROCESS, so a stale id would leak across tests.
     monkeypatch.setattr(harness_client, "_MEMORY_ID", None)
+
+    def fake_shell(session_id, script):
+        fake.log.append("command")
+        fake.commands.append(script)
+
+    monkeypatch.setattr(harness_client, "_shell_exec", fake_shell)
     monkeypatch.setattr(
         harness_client.boto3, "client",
         lambda service, **kw: (fake.control if service.endswith("control")
@@ -362,7 +369,8 @@ def test_fact_count_is_namespaced_by_actor(harness):
     """
     harness_client.count_memory_facts("customer:CUST-200:0101-0000")
     q = harness.memory_queries[-1]
-    assert q["namespace"] == "/actors/customer:CUST-200:0101-0000/facts/"
+    assert q["namespace"] == (
+        "/strategies/semantic-1/actors/customer:CUST-200:0101-0000/")
     assert q["memoryId"] == "demo-mem-abc123"    # id, not the full ARN
 
 
@@ -392,7 +400,8 @@ def test_the_policy_engine_is_shipped_before_the_model_reasons(harness):
     model writes the arithmetic."""
     _run()
     assert harness.log[0] == "command"           # before any invoke
-    assert "def compute_refund" in harness.commands[0]["body"]["command"]
+    body = harness.commands[0].split("<<'B64'\n")[1].split("\nB64")[0]
+    assert "def compute_refund" in base64.b64decode(body).decode()
 
 
 def test_streamed_messages_do_not_run_together(harness, capsys):

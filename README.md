@@ -44,8 +44,12 @@ cannot be prompt-injected or argued with.
 The policy calculator (`refund_calc.py`) is **shipped, not
 model-generated** — a sandbox doesn't make arithmetic deterministic if
 the model writes the arithmetic. It's seeded onto the microVM with
-`InvokeAgentRuntimeCommand`, and the same module is imported by the
+the harness shell WebSocket (`/ws/shells`), and the same module is imported by the
 gate for verification. Money is `Decimal` end to end.
+
+Harness sessions don't accept `InvokeAgentRuntimeCommand` (it returns a
+404 for a harness ARN), so `seed_calculator` opens the shell WebSocket
+signed with SigV4 and writes the file as base64.
 
 ## Files
 
@@ -57,20 +61,39 @@ gate for verification. Money is `Decimal` end to end.
 | `budget.py` | — | Cost/iteration caps, bounded aborts |
 | `harness_client.py` | 5 | invoke → stream → gate → continue; episode records |
 | `demo_run.py` | 10 | The six recorded beats |
-| `evals/test_invariants.py` | 9 | 16 offline tests, no model calls |
+| `evals/test_invariants.py` | 9 | 27 offline tests, no model calls |
 | `evals/test_trajectory.py` | 9 | Live N-run trajectory + memory isolation |
 
 ## Run it
 
 ```bash
-python -m pip install boto3 pydantic pytest
-bash setup.sh                             # AWS setup (read the comments)
+python -m pip install -r requirements.txt   # boto3, pydantic, pytest, websockets
+bash setup.sh                             # AWS setup (read the comments); .\setup.ps1 on Windows
 python gates.py                           # seed the database
-python -m pytest evals/test_invariants.py -v   # 16 tests, offline, ~0.1s
-export HARNESS_ARN=...                    # setup.sh prints this line
+python -m pytest evals/test_invariants.py -v   # 27 tests, offline, ~1s
+export HARNESS_ARN=...                    # setup prints this line (PowerShell: $env:HARNESS_ARN = "...")
 python demo_run.py                        # the recorded scenario (reseeds itself)
 python -m pytest evals/test_trajectory.py -v -s  # 10 live runs + isolation
 ```
+
+### AWS permissions
+
+- **Harness execution role** (`AgentCoreHarnessLabRole`): the setup
+  scripts attach `AgentCoreMemory` and `BedrockInvoke` (model invoke,
+  including the global inference profile). Without `BedrockInvoke` the
+  run fails with `AccessDenied` on `InvokeModelWithResponseStream`.
+- **Caller**: `InvokeHarness`, `InvokeAgentRuntimeCommandShell` (seeding
+  the calculator), `GetHarness`, `GetMemory` and `ListMemoryRecords`
+  (the memory measurements).
+
+### Memory timing
+
+Fact extraction is asynchronous and can take several minutes.
+`wait_for_memory` polls for up to 10 minutes before Beat 5. Facts are
+read from the semantic strategy's namespace,
+`/strategies/<semantic-strategy-id>/actors/<actorId>/`, resolved from the
+memory resource at runtime. If the wait times out, stop the take: Beat 5
+would run with cold memory.
 
 Use **one** interpreter for all of it, and invoke the tests as
 `python -m pytest`. A bare `pytest` resolves independently of `python`,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time setup. Condensed from agentcore-harness-lab Labs 01, 02, 06, 08.
 # Run line by line the first time -- several steps have propagation delays.
-set -euo pipefail
+
 
 # ---- 0. Shell environment (the lab standardises on us-east-1) ----
 export AWS_REGION=us-east-1
@@ -69,6 +69,33 @@ aws iam put-role-policy --role-name "$ROLE_NAME" \
    "Resource": "arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:memory/*"}]}
 EOF
 )"
+
+# The harness calls the model as this role; the Sonnet profile is a global inference profile, so any region.
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name BedrockInvoke \
+  --policy-document "$(cat <<EOF
+{"Version": "2012-10-17",
+ "Statement": [{
+   "Sid": "BedrockInvoke", "Effect": "Allow",
+   "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+   "Resource": ["arn:aws:bedrock:*::foundation-model/anthropic.*",
+                "arn:aws:bedrock:*:${ACCOUNT_ID}:inference-profile/*"]}]}
+EOF
+)"
+
+# Without this the agent's first code_interpreter call fails and it falls back to the shell.
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name CodeInterpreter \
+  --policy-document '{"Version": "2012-10-17",
+ "Statement": [{
+   "Sid": "CodeInterpreter", "Effect": "Allow",
+   "Action": ["bedrock-agentcore:CreateCodeInterpreter",
+              "bedrock-agentcore:StartCodeInterpreterSession",
+              "bedrock-agentcore:InvokeCodeInterpreter",
+              "bedrock-agentcore:StopCodeInterpreterSession",
+              "bedrock-agentcore:GetCodeInterpreter",
+              "bedrock-agentcore:GetCodeInterpreterSession"],
+   "Resource": "arn:aws:bedrock-agentcore:*:*:code-interpreter/*"}]}'
 
 # ---- 3. Model access agreement (once per account, per model) ----
 aws bedrock get-foundation-model-availability \

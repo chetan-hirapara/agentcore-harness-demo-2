@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AgentCoreControlPlane",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:CreateMemory",
+        "bedrock-agentcore:GetMemory",
+        "bedrock-agentcore:ListMemories",
+        "bedrock-agentcore:DeleteMemory",
+        "bedrock-agentcore:CreateHarness",
+        "bedrock-agentcore:GetHarness",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:DeleteHarness"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AgentCorePassRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::058264121536:role/AgentCoreHarnessLabRole"
+    }
+  ]
+}
