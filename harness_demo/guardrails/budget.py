@@ -1,24 +1,21 @@
-"""Layer 2 - Guardrails, runtime enforcement.
+"""Runtime budgets: two layers, deliberately.
 
-Two budget layers, deliberately:
   1. Harness-native caps (maxIterations, maxTokens, timeoutSeconds)
-     passed on invoke_harness -- AWS enforces these inside the loop
-     and reports breaches as stopReason values like
-     "max_iterations_exceeded".
-  2. This client-side ExecutionBudget for what the harness cannot see:
-     cumulative dollar cost across continuation calls and total
-     gated-tool invocations.
+     passed on invoke_harness -- AWS enforces these inside the loop and
+     reports breaches as stopReason values like "max_iterations_exceeded".
+  2. This client-side ExecutionBudget, for what the harness cannot see:
+     cumulative dollar cost across continuation calls and the total
+     number of gated-tool invocations.
 
-If either layer trips, the episode aborts as a *bounded, traced*
-failure instead of an unbounded one.
+If either layer trips, the episode aborts as a *bounded, traced* failure
+(EpisodeAborted) instead of an unbounded one.
 """
 from dataclasses import dataclass, field
 
+from harness_demo.errors import EpisodeAborted
 
-class EpisodeAborted(Exception):
-    def __init__(self, reason: str):
-        self.reason = reason
-        super().__init__(reason)
+HARNESS_LIMIT_STOP_REASONS = ("max_iterations_exceeded", "timeout_exceeded",
+                              "max_output_tokens_exceeded")
 
 
 @dataclass
@@ -49,20 +46,16 @@ class BudgetMeter:
         if self.cost_usd > self.budget.max_cost_usd:
             raise EpisodeAborted(
                 f"BUDGET_EXCEEDED: cost ${self.cost_usd:.3f} "
-                f"> ${self.budget.max_cost_usd:.2f}"
-            )
+                f"> ${self.budget.max_cost_usd:.2f}")
 
     def record_tool_call(self) -> None:
         self.tool_calls += 1
         if self.tool_calls > self.budget.max_tool_calls:
             raise EpisodeAborted(
                 f"BUDGET_EXCEEDED: {self.tool_calls} tool calls "
-                f"> {self.budget.max_tool_calls}"
-            )
+                f"> {self.budget.max_tool_calls}")
 
     def record_stop_reason(self, reason: str) -> None:
         self.stop_reasons.append(reason)
-        # Harness-side caps surface here; treat them as bounded aborts.
-        if reason in ("max_iterations_exceeded", "timeout_exceeded",
-                      "max_output_tokens_exceeded"):
+        if reason in HARNESS_LIMIT_STOP_REASONS:
             raise EpisodeAborted(f"HARNESS_LIMIT: {reason}")

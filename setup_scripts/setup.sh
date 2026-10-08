@@ -154,10 +154,10 @@ echo "HARNESS_ARN=${HARNESS_ARN}"
 
 # ---- 5. Verify before you build on it ----
 # setup.sh exports into its own shell, not yours. Copy this line out, or
-# demo_run.py runs against an empty HARNESS_ARN.
+# demo_run.py has to look the harness up by name.
 echo "Next:"
 echo "  export HARNESS_ARN=${HARNESS_ARN}"
-echo "  python gates.py                       # seed the database"
-echo "  python -m pytest evals/test_invariants.py -v  # 16 offline tests"
-echo "  python demo_run.py                    # the recorded scenario"
+echo "  python -m harness_demo.db             # seed the database (the demo also reseeds)"
+echo "  python -m pytest evals/test_invariants.py -v  # offline tests, no model calls"
+echo "  python demo_run.py                    # the recorded scenario (--pause to step)"
 echo "  agentcore traces list                 # confirm traces are flowing"

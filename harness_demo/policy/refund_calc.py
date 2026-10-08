@@ -6,9 +6,12 @@ policy logic is just non-determinism with better syntax highlighting.
 
 So we ship the calculator. The agent only supplies inputs and runs it
 in the AgentCore code interpreter. The same module is then imported by
-gates.py to INDEPENDENTLY RECOMPUTE the figure before any money moves —
-if the agent's reported amount disagrees with ours by a cent, the
-refund is blocked.
+the refund gate to INDEPENDENTLY RECOMPUTE the figure before any money
+moves -- if the agent's reported amount disagrees with ours by a cent,
+the refund is blocked.
+
+CONSTRAINT: this file is copied byte-for-byte onto the sandbox microVM,
+so it must stay standard-library only and import nothing from this package.
 
 Money is Decimal end to end. Floats in a money path are a defect, not
 a style preference: 0.1 + 0.2 != 0.3, and a refund is a legal record.
@@ -40,8 +43,8 @@ def days_since_delivery(delivered_on: str, today: date | None = None) -> int:
     """Calendar days from an ISO 'YYYY-MM-DD' delivery date to today.
 
     Lives here, beside RETURN_WINDOW_DAYS, because eligibility is a
-    policy question. gates.py derives this number from the orders table
-    instead of trusting the one the model reports -- otherwise the
+    policy question. The refund gate derives this number from the orders
+    table instead of trusting the one the model reports -- otherwise the
     recompute checks the arithmetic but not the decision.
     """
     return ((today or date.today()) - date.fromisoformat(delivered_on)).days

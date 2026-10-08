@@ -1,152 +1,155 @@
 # agentcore-harness-demo
 
-A production harness around a non-deterministic agent, on **Amazon
+A production-style harness around a non-deterministic agent, on **Amazon
 Bedrock AgentCore**. Domain: e-commerce returns and refunds support.
 
 **The ticket:** *"Order #4711 arrived damaged, I want a refund."*
-Resolving it correctly requires reading customer data, computing money
-under policy, and executing an irreversible write — three different
-risk tiers in one request.
+Resolving it correctly means reading customer data, computing money under
+policy, and executing an irreversible write: three risk tiers in one request.
 
-## The trust boundary
+New to the codebase? Start with [WALKTHROUGH.md](WALKTHROUGH.md). Looking
+for what to harden next? See [IMPROVEMENTS.md](IMPROVEMENTS.md).
 
-Five capabilities, deliberately split across two sides:
+## The idea in one picture
 
-| Capability | Runs on | Why |
+```mermaid
+flowchart LR
+    subgraph AWS["AWS (we observe)"]
+        M[Model] --- H[Harness loop]
+        H --- CI[Code interpreter<br/>runs OUR calculator]
+        H --- MEM[(Managed memory<br/>scoped by actorId)]
+    end
+    subgraph OURS["Our process (we gate)"]
+        G1[run_sql gate<br/>read-only + one customer]
+        G2[issue_refund gate<br/>recompute + idempotency + 2-phase commit]
+        DB[(Support DB + ledger)]
+        EP[(Episode record)]
+    end
+    H -- "pauses: tool_use" --> G1 & G2
+    G1 & G2 --> DB
+    G1 & G2 -- "toolResult" --> H
+    H -. "every step" .-> EP
+```
+
+Anything that can move money or leak data is an `inline_function`: the
+harness **pauses** and hands control to code we own. The gate is not in
+the model's environment, so it cannot be prompt-injected or argued with.
+
+## Three concepts
+
+| Concept | What it is | Where |
 |---|---|---|
-| `code_interpreter` | AWS microVM | Sandboxed compute; AWS handles isolation |
-| managed memory | AWS, actor-scoped | Per-customer history, isolated by `actorId` |
-| `run_sql` (L1 read) | **Our process** | Gated: read-only contract + read-only connection |
-| `issue_refund` (L3 write) | **Our process** | Gated: recompute + idempotency + 2-phase commit |
+| **Harness** | The managed loop that calls the model and its tools | [harness_demo/agent/client.py](harness_demo/agent/client.py) |
+| **Episode** | The audit record of one ticket: both sides of the trust boundary, cost, stop reasons | [harness_demo/agent/episode.py](harness_demo/agent/episode.py) |
+| **Memory** | Per-customer facts: write (instant) -> extract (async) -> retrieve by `actorId` | [harness_demo/agent/memory.py](harness_demo/agent/memory.py) |
 
-Anything that can move money or leak data is an `inline_function`,
-because an inline function pauses the harness loop and hands control
-back to code we own. The gate is not in the model's environment, so it
-cannot be prompt-injected or argued with.
+## Gates before money moves
 
-## Four gates before money moves
+Preceded by a **scope check**: the order must belong to the session's
+customer, and the refusal is identical to "order not found".
 
-1. **Schema** — Pydantic contract on the tool boundary.
-2. **Independent recompute** — we re-run the policy engine ourselves and
-   refuse on any disagreement with the agent's figure. *The model is
-   what transcribed the number, so the number is not trusted.* That
-   includes `days_since_delivery`, which is derived from
-   `orders.delivered_on` rather than believed: it is the input that
-   decides eligibility, so trusting it would recompute the arithmetic
-   but not the decision.
-3. **Idempotency** — key is a hash of the semantic action
-   `(order_id, reason, amount)`, and it's the `PRIMARY KEY` of
-   `refund_intents`. The guarantee is a database uniqueness
+1. **Schema**: Pydantic contract on the tool boundary.
+2. **Independent recompute**: we re-run the policy engine and refuse any
+   disagreement with the agent's figure. That includes
+   `days_since_delivery`, derived from `orders.delivered_on`: it decides
+   eligibility, so trusting it would check the arithmetic but not the
+   decision.
+3. **Idempotency**: the key hashes `(order_id, reason, amount)` and is the
+   `PRIMARY KEY` of `refund_intents`, so the guarantee is a database
    constraint, not application logic a race can slip between.
-4. **Two-phase commit** — `PENDING` before the effect, `COMMITTED`
-   after; a failure mid-flight triggers a compensating rollback.
+4. **Two-phase commit**: `PENDING` before the effect, `COMMITTED` after; a
+   failure mid-flight triggers a compensating rollback.
 
-The policy calculator (`refund_calc.py`) is **shipped, not
-model-generated** — a sandbox doesn't make arithmetic deterministic if
-the model writes the arithmetic. It's seeded onto the microVM with
-the harness shell WebSocket (`/ws/shells`), and the same module is imported by the
-gate for verification. Money is `Decimal` end to end.
+`run_sql` has four layers: a SELECT-only contract, a read-only connection,
+an authorizer, and per-customer views, so a session can only ever see its
+own customer's rows (see [harness_demo/db.py](harness_demo/db.py)).
 
-Harness sessions don't accept `InvokeAgentRuntimeCommand` (it returns a
-404 for a harness ARN), so `seed_calculator` opens the shell WebSocket
-signed with SigV4 and writes the file as base64.
+The policy calculator is **shipped, not model-generated**: a sandbox does
+not make arithmetic deterministic if the model writes the arithmetic. It is
+copied onto the microVM over the harness shell WebSocket, and the same
+module is imported by the gate to verify. Money is `Decimal` end to end.
 
-## Files
+## Layout
 
-| File | Slide | What it is |
-|---|---|---|
-| `gates.py` | 6, 8 | Both tool contracts; the four refund gates |
-| `refund_calc.py` | 7 | Deterministic policy engine (shipped + verifying) |
-| `refund_ledger.py` | 8 | Idempotency keys, two-phase commit, rollback |
-| `budget.py` | — | Cost/iteration caps, bounded aborts |
-| `harness_client.py` | 5 | invoke → stream → gate → continue; episode records |
-| `demo_run.py` | 10 | The six recorded beats |
-| `evals/test_invariants.py` | 9 | 27 offline tests, no model calls |
-| `evals/test_trajectory.py` | 9 | Live N-run trajectory + memory isolation |
+```
+harness_demo/
+  config.py            Settings; harness ARN resolved lazily, never at import
+  db.py                SupportDb, seed data, per-customer scoped connections
+  errors.py            HarnessError, ConfigError, EpisodeAborted, ...
+  policy/              refund_calc.py: deterministic rules (stdlib only)
+  guardrails/          sql_gate, refund_gate, ledger, budget, toolbox
+  agent/               client, stream, episode, memory, sandbox, prompt, tools, observer
+  demo/                narration (text), beats (logic), run (entry point)
+tools/episode_report.py   read saved episodes
+evals/                    tier 1 (offline) and tier 2 (live)
+docs/sample_episode.json  a real episode record
+demo_run.py               thin entry point for the recording
+```
+
+The library never prints. `HarnessClient.run_episode` reports events to an
+observer; the demo plugs in `ConsoleObserver`, tests plug in nothing.
 
 ## Run it
 
-```bash
+```powershell
 python -m pip install -r requirements.txt   # boto3, pydantic, pytest, websockets
-bash setup.sh                             # AWS setup (read the comments); .\setup.ps1 on Windows
-python gates.py                           # seed the database
-python -m pytest evals/test_invariants.py -v   # 27 tests, offline, ~1s
-export HARNESS_ARN=...                    # setup prints this line (PowerShell: $env:HARNESS_ARN = "...")
-python demo_run.py                        # the recorded scenario (reseeds itself)
-python -m pytest evals/test_trajectory.py -v -s  # 10 live runs + isolation
+.\setup.ps1                                 # AWS resources (bash setup.sh on Linux/macOS)
+python -m pytest evals/test_invariants.py -v   # offline, no model calls, ~1s
+python demo_run.py                          # the recorded scenario (reseeds itself)
+python demo_run.py --pause                  # wait for Enter between beats
+python tools/episode_report.py              # what did past episodes do?
+python -m pytest evals/test_trajectory.py -v -s  # live runs + isolation (needs HARNESS_ARN)
 ```
+
+`HARNESS_ARN` is used if set; otherwise the harness named `support_agent`
+is looked up (override with `HARNESS_NAME`). `AWS_REGION` defaults to
+`us-east-1`. Add `--log-level INFO` for the operational log.
+
+Use **one** interpreter and invoke the tests as `python -m pytest`. A bare
+`pytest` resolves independently of `python`, so a machine with two
+environments will happily run the demo on one and the tests on the other.
 
 ### AWS permissions
 
-- **Harness execution role** (`AgentCoreHarnessLabRole`): the setup
-  scripts attach `AgentCoreMemory` and `BedrockInvoke` (model invoke,
-  including the global inference profile). Without `BedrockInvoke` the
+- **Harness execution role** (`AgentCoreHarnessLabRole`): the setup scripts
+  attach `AgentCoreMemory` and `BedrockInvoke`. Without `BedrockInvoke` the
   run fails with `AccessDenied` on `InvokeModelWithResponseStream`.
-- **Caller**: `InvokeHarness`, `InvokeAgentRuntimeCommandShell` (seeding
-  the calculator), `GetHarness`, `GetMemory` and `ListMemoryRecords`
-  (the memory measurements).
+- **Caller**: `InvokeHarness`, `InvokeAgentRuntimeCommandShell` (seeding the
+  calculator), `ListHarnesses`, `GetHarness`, `GetMemory` and
+  `ListMemoryRecords`.
 
 ### Memory timing
 
 Fact extraction is asynchronous and can take several minutes.
-`wait_for_memory` polls for up to 10 minutes before Beat 5. Facts are
-read from the semantic strategy's namespace,
-`/strategies/<semantic-strategy-id>/actors/<actorId>/`, resolved from the
-memory resource at runtime. If the wait times out, stop the take: Beat 5
-would run with cold memory.
-
-Use **one** interpreter for all of it, and invoke the tests as
-`python -m pytest`. A bare `pytest` resolves independently of `python`,
-so a machine with two environments will happily run the demo on the one
-with `boto3` and the tests on the one without.
+`wait_for_facts` polls for up to 10 minutes before Beat 5. If the wait times
+out, stop the take: Beat 5 would run with cold memory.
 
 ## Two-tier eval strategy
 
-Tier 1 (`test_invariants.py`) is deterministic and offline — it runs on
-every commit because the harness is ordinary software. Tier 2
-(`test_trajectory.py`) makes live model calls and asserts on the
-*distribution* across N runs; it runs on a schedule, not per-push.
-Memory isolation is the exception: it's a security property, so one
-failure fails the suite with no pass-rate tolerance.
+Tier 1 (`evals/test_invariants.py`) is deterministic and offline: it runs
+on every commit because the harness is ordinary software. Tier 2
+(`evals/test_trajectory.py`) makes live model calls and asserts on the
+*distribution* across N runs; it runs on a schedule. Memory isolation is
+the exception: it is a security property, so one failure fails the suite.
 
-## What `demo_run.py` shows live:
+## The six beats
 
-1. **Read-only gate** — `UPDATE`, `DELETE`, `DROP` and a stacked
-   `SELECT 1; UPDATE ...` all blocked, driven directly against the same
-   `run_sql` the agent's tool use hits
-2. **The agent works the ticket** — the code interpreter runs *our*
-   shipped calculator → **$172.03**, and `issue_refund` commits after
-   the independent recompute agrees
-3. **Amount gate** — `$999.00` and a 96-cent slip both refused, driven
-   directly against the same `issue_refund`; the correct figure comes
-   back `duplicate=True`, collapsing onto the refund the agent just made
-4. **Retry storm** — the same semantic action replayed 3×, ledger still
-   shows one row *(because the key is the action, not the call site)*
-5. **New session, same customer** — memory answers with **zero tool
-   calls**
-6. **New customer** — asked the same kind of question, the agent has
-   **no record of them at all**; nothing carries across the `actorId`
-   boundary *(note: memory is isolated; row-level SQL access is not —
-   see `code_readme.md`)*
+1. **Read-only gate**: `UPDATE`, `DELETE`, `DROP` and a stacked
+   `SELECT 1; UPDATE ...` are all blocked.
+2. **The agent works the ticket**: the code interpreter runs *our*
+   calculator -> **$172.03**, and `issue_refund` commits after the
+   independent recompute agrees.
+3. **Amount gate**: `$999.00` and a 96-cent slip are refused; the correct
+   figure collapses onto the refund the agent just made.
+4. **Retry storm**: the same action replayed 3x; the ledger keeps one row.
+5. **New session, same customer**: memory answers without a database lookup.
+6. **New customer**: nothing carries across, proved three ways: facts per
+   actor at the memory store, rows per session in the database, and only
+   then the agent's own answer.
 
-### Beats 1 and 3 are driven by us, not by the agent
-
-Those blocked mutations and wrong amounts are direct calls into
-`run_sql` and `issue_refund`. The agent attempts neither: given the
-schema up front it goes straight to `SELECT` and routes the write
-through `issue_refund`, and when its figure matches the policy engine
-there is nothing to refuse.
-
-Driving the gates ourselves is the more honest demonstration. The
-guarantees are a Pydantic contract, a `mode=ro` connection and an
-independent recompute, so they hold whether or not the model misbehaves
-on camera — waiting for it to trip them would be theatre, and would
-prove strictly less. Note the stacked statement fails with a *different*
-error than the rest: it satisfies the `SELECT` regex and dies on the
-read-only connection, which is the second layer doing its job.
-
-Every one of those paths is also proved offline, with no model in the
-loop: `test_mutations_are_blocked`,
-`test_stacked_statement_blocked_by_second_layer`,
-`test_agent_hallucinated_amount_is_refused`, and
-`test_understated_day_count_is_refused`.
+Beats 1 and 3 are driven by us, not by the agent. Given the schema up
+front, the agent never reaches for `UPDATE`, and when its figure matches
+the policy there is nothing to refuse. Calling the gates directly is the
+more honest demonstration: the guarantees hold whether or not the model
+misbehaves on camera. Each is also proved offline in
+`evals/test_invariants.py`.
